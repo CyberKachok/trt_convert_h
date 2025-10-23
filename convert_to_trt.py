@@ -108,11 +108,8 @@ def _build_engine(
             provided = input_shapes.get(tensor.name)
             if provided is None:
                 raise KeyError(f"Missing shape hint for input '{tensor.name}'")
-            sanitized = tuple(
-                dim if dim >= 0 else provided[idx]
-                for idx, dim in enumerate(tensor.shape)
-            )
-            profile.set_shape(tensor.name, sanitized, sanitized, sanitized)
+            concrete = tuple(int(dim) for dim in provided)
+            profile.set_shape(tensor.name, concrete, concrete, concrete)
         config.add_optimization_profile(profile)
 
         engine = builder.build_engine(network, config)
