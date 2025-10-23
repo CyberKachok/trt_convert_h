@@ -83,9 +83,6 @@ class TensorRTRunner:
 
         self.stream.synchronize()
 
-        for device_mem in device_buffers:
-            device_mem.free()
-
         return host_outputs
 
 
@@ -114,10 +111,10 @@ def get_model_forward(engine_path: str | pathlib.Path, tau: float = 1.0):
     runner = TensorRTRunner(pathlib.Path(engine_path))
 
     input_by_name = {binding.name: binding for binding in runner.input_bindings}
-    template_binding = input_by_name.get("template")
-    search_binding = input_by_name.get("search_embedding")
+    search_binding = input_by_name.get("search_image")
+    template_binding = input_by_name.get("template_embedding")
     if template_binding is None or search_binding is None:
-        raise RuntimeError("Engine inputs must be named 'template' and 'search_embedding'")
+        raise RuntimeError("Engine inputs must be named 'search_image' and 'template_embedding'")
 
     def hit_forward(uav_meta, sat_meta):
         search = torch.from_numpy(uav_meta.image).to(torch.float32)
@@ -131,7 +128,10 @@ def get_model_forward(engine_path: str | pathlib.Path, tau: float = 1.0):
         template_np = np.ascontiguousarray(template.cpu().numpy().astype(template_binding.dtype, copy=False))
         search_np = np.ascontiguousarray(search.cpu().numpy().astype(search_binding.dtype, copy=False))
 
-        ordered_inputs = [template_np if binding.name == template_binding.name else search_np for binding in runner.input_bindings]
+        ordered_inputs = [
+            search_np if binding.name == search_binding.name else template_np
+            for binding in runner.input_bindings
+        ]
         logits = runner(*ordered_inputs)[0]
         logits_tensor = torch.from_numpy(logits).to(torch.float32)
         probs = torch.nn.functional.softmax(tau * logits_tensor, dim=1)

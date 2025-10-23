@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
-from typing import Tuple
+from typing import Iterable, Tuple
 
 import torch
 import tensorrt as trt
@@ -24,6 +24,14 @@ def _load_cfg(path: pathlib.Path):
     if "net" in cfg and "cfg" in cfg.net:
         return cfg.net.cfg
     return cfg
+
+
+def _select_int(cfg, keys: Iterable[str]) -> int:
+    for key in keys:
+        value = OmegaConf.select(cfg, key)
+        if value is not None:
+            return int(value)
+    raise AttributeError("Missing configuration value")
 
 
 def _build_model(cfg, checkpoint: pathlib.Path, device: torch.device) -> torch.nn.Module:
@@ -52,13 +60,13 @@ def _export_onnx(
         model,
         (dummy_uav, dummy_sat_embed),
         onnx_path,
-        input_names=["template", "search_embedding"],
+        input_names=["search_image", "template_embedding"],
         output_names=["logits"],
         opset_version=17,
         do_constant_folding=True,
         dynamic_axes={
-            "template": {0: "batch"},
-            "search_embedding": {0: "batch"},
+            "search_image": {0: "batch"},
+            "template_embedding": {0: "batch"},
             "logits": {0: "batch"},
         },
     )
@@ -69,6 +77,7 @@ def _build_engine(
     engine_path: pathlib.Path,
     precision: str,
     workspace_size: int,
+    input_shapes: dict[str, Tuple[int, ...]],
 ) -> None:
     logger = trt.Logger(trt.Logger.WARNING)
     network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
@@ -96,8 +105,14 @@ def _build_engine(
         profile = builder.create_optimization_profile()
         for i in range(network.num_inputs):
             tensor = network.get_input(i)
-            shape = tuple(tensor.shape)
-            profile.set_shape(tensor.name, shape, shape, shape)
+            provided = input_shapes.get(tensor.name)
+            if provided is None:
+                raise KeyError(f"Missing shape hint for input '{tensor.name}'")
+            sanitized = tuple(
+                dim if dim >= 0 else provided[idx]
+                for idx, dim in enumerate(tensor.shape)
+            )
+            profile.set_shape(tensor.name, sanitized, sanitized, sanitized)
         config.add_optimization_profile(profile)
 
         engine = builder.build_engine(network, config)
@@ -139,17 +154,23 @@ def main() -> None:
 
     cfg = _load_cfg(args.cfg)
     try:
-        uav_size = int(cfg.DATA.SEARCH.SIZE)
-        sat_size = int(cfg.DATA.TEMPLATE.SIZE)
+        uav_size = _select_int(cfg, ("DATA.SEARCH.SIZE", "DATA.SEARCH.RES"))
+        sat_size = _select_int(cfg, ("DATA.TEMPLATE.SIZE", "DATA.TEMPLATE.RES"))
     except AttributeError as exc:
-        raise AttributeError("Config must provide DATA.SEARCH.SIZE and DATA.TEMPLATE.SIZE") from exc
+        raise AttributeError(
+            "Config must provide DATA.SEARCH.SIZE/RES and DATA.TEMPLATE.SIZE/RES"
+        ) from exc
 
     model = _build_model(cfg, args.checkpoint, device)
     dummy_uav, dummy_sat_embed = _dummy_inputs(model, device, uav_size, sat_size)
 
     onnx_path = args.onnx or args.engine.with_suffix(".onnx")
     _export_onnx(model, dummy_uav, dummy_sat_embed, onnx_path)
-    _build_engine(onnx_path, args.engine, args.precision, args.workspace)
+    shape_hints = {
+        "search_image": tuple(dummy_uav.shape),
+        "template_embedding": tuple(dummy_sat_embed.shape),
+    }
+    _build_engine(onnx_path, args.engine, args.precision, args.workspace, shape_hints)
 
     print(f"TensorRT engine saved to {args.engine}")
 
